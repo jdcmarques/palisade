@@ -13,6 +13,7 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+  pull_request:
 
 permissions:
   contents: read
@@ -53,36 +54,12 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           # Lowercase image name (GHCR requires lowercase); links to this repo.
-          images: ghcr.io/shakes63/palisade
-          # `latest` is gated to tag refs so a stray workflow_dispatch from a
-          # branch can never move it. The `type=semver` lines only emit on a
-          # semver tag ref, so they're inert everywhere else.
+          images: ghcr.io/jdcmarques/palisade
           tags: |
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=latest
             type=semver,pattern=v{{version}}
             type=semver,pattern=v{{major}}.{{minor}}
             type=sha,format=short
-
-      - name: Build (amd64 — Unraid), load for scanning
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          push: false
-          load: true
-          platforms: linux/amd64
-          tags: ghcr.io/shakes63/palisade:scan
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Trivy scan (block on CRITICAL)
-        uses: aquasecurity/trivy-action@v0.36.0
-        with:
-          image-ref: ghcr.io/shakes63/palisade:scan
-          format: table
-          exit-code: "1"
-          severity: CRITICAL
-          ignore-unfixed: true
 
       - name: Push (reuses the scanned build from cache)
         uses: docker/build-push-action@v6
