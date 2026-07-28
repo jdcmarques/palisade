@@ -83,6 +83,10 @@ export interface RuntimeSpecInput {
   /** Advanced: pin the game image to a specific tag (e.g. a prior version) instead of
    *  the shipped default. Invalid/blank falls back to the default tag. */
   imageTag?: string | null;
+  /** Palworld only: run the image's own SteamCMD update check on this boot. Set only
+   *  for the one start triggered by "Install / Update" — plain Start/Restart never
+   *  update, so a running world can't silently jump versions underneath the players. */
+  updateOnBoot?: boolean;
 }
 
 /** Build the Docker create spec for a game-server container. */
@@ -510,7 +514,7 @@ function buildPalworldSpec(input: RuntimeSpecInput): Docker.ContainerCreateOptio
     `MULTITHREADING=true`,
     // The manager owns updates/backups/restarts — turn off the image's own loops.
     // (A fresh instance still installs on first boot regardless of UPDATE_ON_BOOT.)
-    `UPDATE_ON_BOOT=true`,
+    `UPDATE_ON_BOOT=${input.updateOnBoot ? "true" : "false"}`,
     `BACKUP_ENABLED=false`,
     `AUTO_REBOOT_ENABLED=false`,
     // NOTE: the UE4SS mod framework is NOT preloaded via a container-wide LD_PRELOAD.
