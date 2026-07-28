@@ -221,6 +221,11 @@ export class ServersService implements OnApplicationBootstrap {
    * race the exit).
    */
   private readonly stopping = new Set<string>();
+  /** Palworld servers whose current boot ran with updateOnBoot — a SteamCMD update
+   *  rewrites PalServer.sh mid-boot, wiping the LD_PRELOAD patch writeInis applied
+   *  before start. onReady consumes this to force one follow-up restart (no update)
+   *  so a UE4SS-enabled server doesn't silently lose its mod loader after an update. */
+  private readonly pendingUpdateRepatch = new Set<string>();
   /** On-disk instance size (MB), refreshed in the background — `du` is too slow to
    *  run inline on every stats poll. */
   private readonly diskCache = new Map<string, { mb: number; at: number }>();
@@ -826,10 +831,24 @@ export class ServersService implements OnApplicationBootstrap {
     const server = await this.prisma.server.findUnique({ where: { id } });
     if (!server) throw new NotFoundException("Server not found");
     const jobId = await this.installer.install(server.game as Game, { serverId: id });
+    // Palworld's image only checks SteamCMD for a newer build when UPDATE_ON_BOOT is
+    // set on that boot, so "Install / Update" is its sole update trigger — fire the
+    // one start carrying the flag; plain Start/Restart afterward stay update-free.
+    if (
+      server.game === Game.PALWORLD &&
+      [ServerState.Stopped, ServerState.Crashed].includes(server.state as ServerState)
+    ) {
+      void this.start(id, { updateOnBoot: true }).catch((e) =>
+        this.logger.warn(`Palworld update start for ${id} failed: ${(e as Error).message}`),
+      );
+    }
     return { jobId };
   }
 
-  async start(id: string, opts: { force?: boolean; stopFirst?: string } = {}): Promise<void> {
+  async start(
+    id: string,
+    opts: { force?: boolean; stopFirst?: string; updateOnBoot?: boolean } = {},
+  ): Promise<void> {
     if (opts.stopFirst && opts.stopFirst !== id) {
       // Swap: back up the outgoing server, then stop it (freeing RAM), then start
       // this one. The backup is best-effort — the graceful stop also saves the world
@@ -848,7 +867,7 @@ export class ServersService implements OnApplicationBootstrap {
     // but not a restart-in-place, which re-uses files already on disk. A near-full
     // volume corrupts a fresh install and starves a running server's saves.
     if (!opts.force) await this.assertDiskAvailable(id);
-    return this.withLock(id, () => this.doStart(id));
+    return this.withLock(id, () => this.doStart(id, { updateOnBoot: opts.updateOnBoot }));
   }
 
   /** Throw a 409 (with the running servers + RAM) if starting `id` would exceed the
@@ -1009,7 +1028,10 @@ export class ServersService implements OnApplicationBootstrap {
   /** Assemble the full Docker create spec for a server row — decrypted
    *  passwords, catalog, mods, timezone. Shared by start() and by container
    *  adoption (which needs the spec's Binds to map foreign volume data in). */
-  async assembleSpec(server: ServerRow): Promise<Docker.ContainerCreateOptions> {
+  async assembleSpec(
+    server: ServerRow,
+    opts: { updateOnBoot?: boolean } = {},
+  ): Promise<Docker.ContainerCreateOptions> {
     const game = server.game as Game;
     // Both ARK images install their own mods on first boot (POK via MOD_IDS,
     // hermsi via `arkmanager installmod`), so nothing to pre-download here.
@@ -1067,10 +1089,11 @@ export class ServersService implements OnApplicationBootstrap {
       pzModNames,
       iconUrl,
       imageTag: server.imageTag,
+      updateOnBoot: opts.updateOnBoot,
     });
   }
 
-  private async doStart(id: string): Promise<void> {
+  private async doStart(id: string, opts: { updateOnBoot?: boolean } = {}): Promise<void> {
     const server = (await this.prisma.server.findUnique({
       where: { id },
       include: { cluster: true },
@@ -1105,6 +1128,11 @@ export class ServersService implements OnApplicationBootstrap {
       }
       await this.configWriter.writeInis(server);
 
+      if (opts.updateOnBoot && game === Game.PALWORLD) {
+        const cfg = JSON.parse(server.configJson) as ServerConfigValues;
+        if (cfg.values?._palFramework) this.pendingUpdateRepatch.add(id);
+      }
+
       // Bedrock's itzg image drops to UID/GID (env.PUID/PGID) and writes throughout
       // /data (starting with /data/.tmp) — but a freshly bind-mounted instance dir is
       // root-owned, so it can't, and the server exits. (The Java image chowns /data
@@ -1127,7 +1155,7 @@ export class ServersService implements OnApplicationBootstrap {
         await chown(dataDir, SERVER_UID[game], SERVER_GID[game]).catch(() => undefined);
       }
 
-      const spec = await this.assembleSpec(server);
+      const spec = await this.assembleSpec(server, opts);
 
       // Fresh run → wipe the captured log/console so it starts clean.
       this.logCapture.clear(id);
@@ -1404,6 +1432,14 @@ export class ServersService implements OnApplicationBootstrap {
       void this.installer
         .seedGameFilesCache(id, server.game as Game)
         .catch((e) => this.logger.warn(`cache seed failed: ${(e as Error).message}`));
+    }
+    if (this.pendingUpdateRepatch.delete(id)) {
+      // This boot's SteamCMD update rewrote PalServer.sh, wiping the LD_PRELOAD patch
+      // applied before start — restart once (no update this time) so writeInis
+      // re-patches the now-updated launcher before players reconnect.
+      void this.restart(id).catch((e) =>
+        this.logger.warn(`post-update UE4SS repatch restart for ${id} failed: ${(e as Error).message}`),
+      );
     }
   }
 
